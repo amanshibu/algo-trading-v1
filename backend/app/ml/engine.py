@@ -1,11 +1,11 @@
 """
 ML Engine (Quant Brain)
 
-This module is responsible for:
-- Fetching market data
-- Detecting market regime
-- Generating high-probability trading signals
-- Returning structured data (NO prints, NO FastAPI here)
+Responsibilities:
+- Fetch market data
+- Detect market regime
+- Generate trading signals
+- Return structured data only
 """
 
 import yfinance as yf
@@ -26,6 +26,7 @@ STOCKS = [
 ]
 
 BENCHMARK = "^NSEI"
+ENTRY_Z = 1.2
 
 
 # =========================
@@ -40,7 +41,9 @@ def fetch_market_data(period="6mo", interval="1h"):
         progress=False
     )["Close"]
 
+    data = data.dropna()
     returns = data.pct_change(fill_method=None).dropna()
+
     return data, returns
 
 
@@ -50,30 +53,22 @@ def fetch_market_data(period="6mo", interval="1h"):
 
 def detect_market_regime(data: pd.DataFrame | None = None):
     """
-    Detects market regime using BENCHMARK only.
+    Always return BULLISH or BEARISH.
     """
 
     if data is None:
         market = yf.download(BENCHMARK, period="3mo", interval="1d", progress=False)
-        close = market["Close"]
+        close = market["Close"].dropna()
     else:
-        # Backtest mode: data is already benchmark history
-        close = data["Close"]
+        close = data["Close"].dropna()
 
-    # 🔑 Convert to scalar values
-    ma_50 = close.rolling(50).mean().iloc[-1]
-    price = close.iloc[-1]
-
-    ma_50 = float(ma_50)
-    price = float(price)
-
-    if price > ma_50 * 1.01:
-        return "BULLISH"
-    elif price < ma_50 * 0.99:
+    if len(close) < 50:
         return "BEARISH"
-    else:
-        return "NEUTRAL"
 
+    ma_50 = float(close.rolling(50).mean().values[-1])
+    price = float(close.values[-1])
+
+    return "BULLISH" if price >= ma_50 else "BEARISH"
 
 
 def build_correlation_clusters(returns, threshold=0.6):
@@ -82,7 +77,8 @@ def build_correlation_clusters(returns, threshold=0.6):
 
     for i in range(len(corr.columns)):
         for j in range(i + 1, len(corr.columns)):
-            if corr.iloc[i, j] > threshold:
+            val = corr.iloc[i, j]
+            if not np.isnan(val) and val > threshold:
                 G.add_edge(corr.columns[i], corr.columns[j])
 
     return list(nx.connected_components(G))
@@ -90,7 +86,7 @@ def build_correlation_clusters(returns, threshold=0.6):
 
 def find_best_pair(data, cluster):
     best_signal = None
-    best_z = 0
+    best_z = 0.0
 
     cluster = list(cluster)
 
@@ -98,11 +94,18 @@ def find_best_pair(data, cluster):
         for j in range(i + 1, len(cluster)):
             a, b = cluster[i], cluster[j]
 
-            spread = data[a] - (data[a].mean() / data[b].mean()) * data[b]
+            ratio = data[a].mean() / data[b].mean()
+            spread = data[a] - ratio * data[b]
+            spread = spread.dropna()
+
+            if len(spread) < 50:
+                continue
+
             filtered = kalman_filter(spread.values)
 
             theta, mu, sigma = get_ou_params(filtered)
-            if sigma == 0:
+
+            if sigma is None or sigma <= 1e-6:
                 continue
 
             z = (filtered[-1] - mu) / sigma
@@ -119,13 +122,12 @@ def find_best_pair(data, cluster):
 
 
 # =========================
-# MASTER ENGINE (THE BRAIN)
+# MASTER ENGINE
 # =========================
 
 def generate_signal():
     """
-    Main entry point called by API.
-    Returns ONE best signal or None.
+    Main engine entry point.
     """
 
     data, returns = fetch_market_data()
@@ -141,26 +143,27 @@ def generate_signal():
         if signal:
             z = signal["z_score"]
 
-            action = "WAIT"
-            confidence = 0.0
-
-            if z < -2 and regime == "BULLISH":
+            if z < -ENTRY_Z:
                 action = "BUY A / SELL B"
-                confidence = 0.60
-
-            elif z > 2 and regime == "BEARISH":
+                reason = f"Spread extremely low (z={z})"
+            elif z > ENTRY_Z:
                 action = "SELL A / BUY B"
-                confidence = 0.60
+                reason = f"Spread extremely high (z={z})"
+            else:
+                continue
 
-            if action != "WAIT":
-                return {
-                    "regime": regime,
-                    "signal": {
-                        **signal,
-                        "action": action,
-                        "confidence": confidence
-                    }
+            confidence = min(abs(z) / 3, 0.85)
+
+            return {
+                "regime": regime,
+                "signal": {
+                    **signal,
+                    "action": action,
+                    "confidence": confidence,
+                    "reason": reason,
+                    "entry_threshold": ENTRY_Z
                 }
+            }
 
     return {
         "regime": regime,
