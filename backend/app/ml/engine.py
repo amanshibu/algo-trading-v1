@@ -58,8 +58,13 @@ def detect_market_regime(data: pd.DataFrame | None = None):
 
     if data is None:
         market = yf.download(BENCHMARK, period="3mo", interval="1d", progress=False)
+        if isinstance(market.columns, pd.MultiIndex):
+            market.columns = market.columns.droplevel("Ticker")
         close = market["Close"].dropna()
     else:
+        if isinstance(data.columns, pd.MultiIndex):
+            data = data.copy()
+            data.columns = data.columns.droplevel("Ticker")
         close = data["Close"].dropna()
 
     if len(close) < 50:
