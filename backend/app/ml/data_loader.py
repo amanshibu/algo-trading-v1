@@ -1,5 +1,5 @@
 import yfinance as yf
-from app.core.config import STOCKS, BENCHMARK
+from app.ml.engine import STOCKS, BENCHMARK
 
 def load_stock_data(period="6mo", interval="1h"):
     data = yf.download(

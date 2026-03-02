@@ -14,7 +14,7 @@ import pandas as pd
 import networkx as nx
 
 from app.ml.math_engine import kalman_filter, get_ou_params
-
+from app.ml.cache import ttl_cache
 
 # =========================
 # CONFIG
@@ -33,16 +33,18 @@ ENTRY_Z = 1.2
 # DATA LAYER
 # =========================
 
+@ttl_cache(ttl_seconds=300)
 def fetch_market_data(period="6mo", interval="1h"):
     data = yf.download(
         STOCKS,
         period=period,
         interval=interval,
-        progress=False
+        progress=False,
+        timeout=10
     )["Close"]
 
     data = data.dropna()
-    returns = data.pct_change(fill_method=None).dropna()
+    returns = data.pct_change().dropna()
 
     return data, returns
 
@@ -51,15 +53,20 @@ def fetch_market_data(period="6mo", interval="1h"):
 # STRATEGIES
 # =========================
 
+@ttl_cache(ttl_seconds=3600)
+def _fetch_benchmark(period, interval):
+    market = yf.download(BENCHMARK, period=period, interval=interval, progress=False, timeout=10)
+    if isinstance(market.columns, pd.MultiIndex):
+        market.columns = market.columns.droplevel(0)
+    return market
+
 def detect_market_regime(data: pd.DataFrame | None = None):
     """
     Always return BULLISH or BEARISH.
     """
 
     if data is None:
-        market = yf.download(BENCHMARK, period="3mo", interval="1d", progress=False)
-        if isinstance(market.columns, pd.MultiIndex):
-            market.columns = market.columns.droplevel("Ticker")
+        market = _fetch_benchmark("3mo", "1d")
         close = market["Close"].dropna()
     else:
         if isinstance(data.columns, pd.MultiIndex):

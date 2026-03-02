@@ -1,4 +1,4 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 import yfinance as yf
 import pandas as pd
@@ -10,6 +10,8 @@ from app.ml.paper_trader import (
     get_portfolio, execute_trade as pt_execute,
     add_virtual_funds, reset_portfolio,
 )  # 👈 PAPER TRADING
+from app.routes.auth import get_optional_user
+from app.ml.cache import ttl_cache
 
 router = APIRouter(
     prefix="/strategy",
@@ -176,33 +178,50 @@ class FundsRequest(BaseModel):
 
 
 @router.post("/execute-trade")
-def execute_paper_trade(data: TradeRequest):
+def execute_paper_trade(data: TradeRequest, user: dict = Depends(get_optional_user)):
     """
     Execute a paper trade with virtual money.
     Actions: BUY, SELL, CLOSE
     """
-    return pt_execute(data.ticker, data.action, data.qty)
+    return pt_execute(user["email"], data.ticker, data.action, data.qty)
 
 
 @router.get("/paper-portfolio")
-def paper_portfolio():
+def paper_portfolio(user: dict = Depends(get_optional_user)):
     """
     Returns the current paper trading portfolio state.
     """
-    return get_portfolio()
+    return get_portfolio(user["email"])
 
 
 @router.post("/paper-add-funds")
-def paper_add_funds(data: FundsRequest):
+def paper_add_funds(data: FundsRequest, user: dict = Depends(get_optional_user)):
     """Add virtual funds to the paper trading balance."""
-    return add_virtual_funds(data.amount)
+    return add_virtual_funds(user["email"], data.amount)
 
 
 @router.post("/paper-reset")
-def paper_reset():
+def paper_reset(user: dict = Depends(get_optional_user)):
     """Reset paper portfolio to initial state."""
-    return reset_portfolio()
+    return reset_portfolio(user["email"])
 
+
+@router.get("/market-status")
+def market_status():
+    """
+    Returns current NSE market status.
+    is_open: true between 9:15 AM – 3:30 PM IST, Mon-Fri.
+    """
+    from app.ml.paper_trader import _market_status
+    return _market_status()
+
+
+@ttl_cache(ttl_seconds=60)
+def _fetch_ticker_data(tickers):
+    data = yf.download(tickers, period="2d", interval="1d", progress=False, timeout=10)["Close"]
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.droplevel(0)
+    return data
 
 @router.get("/ticker")
 def get_ticker_prices():
@@ -212,11 +231,7 @@ def get_ticker_prices():
     BANK_NIFTY = "^NSEBANK"
     tickers = STOCKS + [BENCHMARK, BANK_NIFTY]
     try:
-        data = yf.download(tickers, period="2d", interval="1d", progress=False)["Close"]
-
-        # Handle MultiIndex columns from yfinance
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.droplevel(0)
+        data = _fetch_ticker_data(tickers)
 
         results = []
         for ticker in tickers:
@@ -252,3 +267,90 @@ def get_ticker_prices():
         return results
     except Exception as e:
         return []
+
+@router.get("/auto-alerts")
+def get_auto_alerts():
+    """
+    Returns the recent algorithmic auto-execution alerts and reasoning.
+    """
+    from app.ml.auto_trader import get_alerts
+    return get_alerts()
+
+# =========================
+# AngelOne Live Trading
+# =========================
+
+class LiveTradeRequest(BaseModel):
+    tradingsymbol: str   # e.g. "RELIANCE-EQ"
+    symboltoken: str     # e.g. "2885" — from AngelOne instrument list
+    exchange: str        # "NSE" | "BSE" | "NFO"
+    action: str          # "BUY" | "SELL"
+    qty: int = 1
+    order_type: str = "MARKET"   # "MARKET" | "LIMIT"
+    product: str = "INTRADAY"    # "INTRADAY" | "DELIVERY"
+    price: float = 0             # required for LIMIT orders
+
+
+@router.post("/live-trade")
+def execute_live_trade(data: LiveTradeRequest, user: dict = Depends(get_optional_user)):
+    """
+    Execute a REAL trade via AngelOne SmartAPI.
+
+    Requires ANGELONE_CLIENT_ID, ANGELONE_PIN, and ANGELONE_TOTP_SECRET
+    to be set in backend/.env (ANGELONE_API_KEY is already set).
+
+    To find symboltoken for a stock, visit:
+    https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json
+    """
+    try:
+        from app.trading.angelone_broker import place_order
+        result = place_order(
+            tradingsymbol=data.tradingsymbol,
+            symboltoken=data.symboltoken,
+            exchange=data.exchange,
+            action=data.action,
+            qty=data.qty,
+            order_type=data.order_type,
+            product=data.product,
+            price=data.price,
+        )
+        return {
+            "status": "submitted",
+            "mode": "LIVE",
+            "order": result,
+            "executed_by": user.get("email", "demo"),
+        }
+    except RuntimeError as e:
+        # Missing credentials — helpful message
+        return {
+            "status": "error",
+            "mode": "LIVE",
+            "error": str(e),
+            "hint": "Fill in ANGELONE_CLIENT_ID, ANGELONE_PIN, ANGELONE_TOTP_SECRET in backend/.env"
+        }
+    except Exception as e:
+        return {"status": "error", "mode": "LIVE", "error": str(e)}
+
+
+@router.get("/live-holdings")
+def live_holdings():
+    """Fetch real holdings from AngelOne (requires full credentials in .env)."""
+    try:
+        from app.trading.angelone_broker import get_holdings
+        return {"status": "ok", "mode": "LIVE", "holdings": get_holdings()}
+    except RuntimeError as e:
+        return {"status": "error", "error": str(e), "hint": "Complete .env setup first"}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@router.get("/live-positions")
+def live_positions():
+    """Fetch real intraday positions from AngelOne (requires full credentials in .env)."""
+    try:
+        from app.trading.angelone_broker import get_positions
+        return {"status": "ok", "mode": "LIVE", "positions": get_positions()}
+    except RuntimeError as e:
+        return {"status": "error", "error": str(e), "hint": "Complete .env setup first"}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}

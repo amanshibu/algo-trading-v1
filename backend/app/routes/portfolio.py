@@ -1,14 +1,17 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
+from app.routes.auth import get_optional_user
+from app.ml.paper_trader import get_portfolio
 
 router = APIRouter(prefix="/portfolio", tags=["portfolio"])
 
 @router.get("/summary")
-def summary():
+def summary(user: dict = Depends(get_optional_user)):
+    p = get_portfolio(user["email"])
     return {
-        "total_value": 178542,
-        "daily_pnl": 1240,
-        "cash": 32140,
-        "active_strategies": 4,
+        "total_value": p["net_worth"],
+        "daily_pnl": p["total_unrealised_pnl"] + p["total_realised_pnl"],
+        "cash": p["balance"],
+        "active_strategies": len(p["positions"]),
         "mode": "SIMULATED"
     }
 

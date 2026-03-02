@@ -28,9 +28,13 @@ def get_ou_params(spread):
 
     try:
         m, c = np.linalg.lstsq(A, y, rcond=None)[0]
+        # Guard: np.log(m) is undefined/NaN when m <= 0 or m >= 1
+        # These cases indicate a non-mean-reverting (explosive) spread — skip.
+        if m <= 0 or m >= 1:
+            return 0, 0, None
         theta = -np.log(m)
         mu = c / (1 - m)
         sigma = np.std(spread)
         return theta, mu, sigma
-    except:
-        return 0, 0, 0
+    except Exception:
+        return 0, 0, None

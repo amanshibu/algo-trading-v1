@@ -1,4 +1,7 @@
 from fastapi import FastAPI
+from contextlib import asynccontextmanager
+import asyncio
+from app.ml.auto_trader import auto_trader_loop
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -14,12 +17,21 @@ from app.routes.portfolio import router as portfolio_router
 
 load_dotenv()
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: Launch auto trader background task
+    task = asyncio.create_task(auto_trader_loop())
+    yield
+    # Shutdown: Clean up task
+    task.cancel()
+
 # =========================
 # Create FastAPI app FIRST
 # =========================
 app = FastAPI(
     title="Algo Trading Platform",
-    version="0.1.0"
+    version="0.1.0",
+    lifespan=lifespan
 )
 
 # =========================

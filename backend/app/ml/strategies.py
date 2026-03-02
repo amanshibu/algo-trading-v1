@@ -1,6 +1,6 @@
 import networkx as nx
 import numpy as np
-from app.ml.math_engine import MathEngine
+from app.ml.math_engine import kalman_filter, get_ou_params
 
 def strategy_graph_clustering(returns, threshold=0.6):
     corr = returns.corr()
@@ -24,10 +24,10 @@ def strategy_stat_arb(data, cluster):
             hedge_ratio = data[a].mean() / data[b].mean()
             spread = data[a] - hedge_ratio * data[b]
 
-            true_spread = MathEngine.kalman_filter(spread.values)
-            theta, mu, sigma = MathEngine.get_ou_params(true_spread)
+            true_spread = kalman_filter(spread.values)
+            theta, mu, sigma = get_ou_params(true_spread)
 
-            if sigma == 0:
+            if sigma is None or sigma <= 0:
                 continue
 
             z = (true_spread[-1] - mu) / sigma

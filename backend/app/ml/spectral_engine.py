@@ -17,6 +17,7 @@ Math:
 
 import numpy as np
 import yfinance as yf
+from app.ml.cache import ttl_cache
 
 STOCKS = [
     "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS",
@@ -28,10 +29,11 @@ CORR_THRESHOLD = 0.4  # kill edges below this
 SIGNAL_THRESHOLD = 0.0002  # residual threshold for trade signals
 
 
+@ttl_cache(ttl_seconds=300)
 def _fetch_returns(period="5d", interval="15m"):
-    data = yf.download(STOCKS, period=period, interval=interval, progress=False)["Close"]
+    data = yf.download(STOCKS, period=period, interval=interval, progress=False, timeout=10)["Close"]
     data = data.dropna()
-    returns = data.pct_change(fill_method=None).dropna()
+    returns = data.pct_change().dropna()
     return returns
 
 
