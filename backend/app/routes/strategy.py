@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 import yfinance as yf
 import pandas as pd
 from datetime import datetime
@@ -11,6 +12,7 @@ from app.ml.paper_trader import (
     add_virtual_funds, reset_portfolio,
 )  # 👈 PAPER TRADING
 from app.routes.auth import get_optional_user
+from app.database.db import get_db
 from app.ml.cache import ttl_cache
 
 router = APIRouter(
@@ -137,6 +139,24 @@ def list_strategies():
     return strategies
 
 
+import os
+@router.get("/backtest-logs")
+def get_backtest_logs(lines: int = 150):
+    """
+    Returns the latest N lines from the backtest.log file for the frontend terminal.
+    """
+    log_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "logs", "backtest.log")
+    try:
+        if not os.path.exists(log_path):
+            return {"logs": ["No backtest logs found yet. Run a strategy to generate logs."]}
+            
+        with open(log_path, "r", encoding="utf-8") as f:
+            # Read all lines and return the last 'lines' count
+            all_lines = f.readlines()
+            return {"logs": [line.strip() for line in all_lines[-lines:]]}
+    except Exception as e:
+        return {"logs": [f"Error reading logs: {str(e)}"]}
+
 @router.get("/correlation-heatmap")
 def correlation_heatmap():
     """
@@ -178,32 +198,38 @@ class FundsRequest(BaseModel):
 
 
 @router.post("/execute-trade")
-def execute_paper_trade(data: TradeRequest, user: dict = Depends(get_optional_user)):
+def execute_paper_trade(data: TradeRequest, user=Depends(get_optional_user),
+                        db: Session = Depends(get_db)):
     """
     Execute a paper trade with virtual money.
     Actions: BUY, SELL, CLOSE
     """
-    return pt_execute(user["email"], data.ticker, data.action, data.qty)
+    email = user["email"] if isinstance(user, dict) else user.email
+    return pt_execute(email, data.ticker, data.action, data.qty, db)
 
 
 @router.get("/paper-portfolio")
-def paper_portfolio(user: dict = Depends(get_optional_user)):
+def paper_portfolio(user=Depends(get_optional_user), db: Session = Depends(get_db)):
     """
     Returns the current paper trading portfolio state.
     """
-    return get_portfolio(user["email"])
+    email = user["email"] if isinstance(user, dict) else user.email
+    return get_portfolio(email, db)
 
 
 @router.post("/paper-add-funds")
-def paper_add_funds(data: FundsRequest, user: dict = Depends(get_optional_user)):
+def paper_add_funds(data: FundsRequest, user=Depends(get_optional_user),
+                    db: Session = Depends(get_db)):
     """Add virtual funds to the paper trading balance."""
-    return add_virtual_funds(user["email"], data.amount)
+    email = user["email"] if isinstance(user, dict) else user.email
+    return add_virtual_funds(email, data.amount, db)
 
 
 @router.post("/paper-reset")
-def paper_reset(user: dict = Depends(get_optional_user)):
+def paper_reset(user=Depends(get_optional_user), db: Session = Depends(get_db)):
     """Reset paper portfolio to initial state."""
-    return reset_portfolio(user["email"])
+    email = user["email"] if isinstance(user, dict) else user.email
+    return reset_portfolio(email, db)
 
 
 @router.get("/market-status")
@@ -239,14 +265,18 @@ def get_ticker_prices():
                 col = data[ticker].dropna()
                 if len(col) < 1:
                     continue
+                    
+                try:
+                    current_price = float(col.iloc[-1])
 
-                current_price = float(col.iloc[-1])
-
-                # Calculate daily change
-                if len(col) >= 2:
-                    prev_price = float(col.iloc[-2])
-                    change = round(((current_price - prev_price) / prev_price) * 100, 2)
-                else:
+                    # Calculate daily change
+                    if len(col) >= 2:
+                        prev_price = float(col.iloc[-2])
+                        change = round(((current_price - prev_price) / prev_price) * 100, 2)
+                    else:
+                        change = 0.0
+                except AttributeError:
+                    current_price = float(col)
                     change = 0.0
 
                 # Clean up display name
@@ -318,7 +348,7 @@ def execute_live_trade(data: LiveTradeRequest, user: dict = Depends(get_optional
             "status": "submitted",
             "mode": "LIVE",
             "order": result,
-            "executed_by": user.get("email", "demo"),
+            "executed_by": user.get("email") if isinstance(user, dict) else user.email,
         }
     except RuntimeError as e:
         # Missing credentials — helpful message

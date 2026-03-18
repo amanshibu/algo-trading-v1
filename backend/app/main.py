@@ -10,19 +10,20 @@ from dotenv import load_dotenv
 from app.routes.health import router as health_router
 from app.routes.strategy import router as strategy_router
 from app.routes.dashboard import router as dashboard_router
-
 from app.routes.auth import router as auth_router
 from app.routes.portfolio import router as portfolio_router
+from app.database.db import init_db
 
 
 load_dotenv()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Launch auto trader background task
+    # Startup: initialise database tables, then launch auto trader
+    init_db()
     task = asyncio.create_task(auto_trader_loop())
     yield
-    # Shutdown: Clean up task
+    # Shutdown: clean up task
     task.cancel()
 
 # =========================

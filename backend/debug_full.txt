@@ -1,0 +1,39 @@
+﻿python : Traceback (most 
+recent call last):
+At line:1 char:29
++ cd 
+y:\Mini_Project\backend; 
+python -W ignore -c "
++                          
+   ~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo         
+     : NotSpecified: (Tra  
+  ceback (most recent ca   
+ ll last)::String) [],     
+RemoteException
+    + FullyQualifiedErrorI 
+   d : NativeCommandError
+ 
+  File "<string>", line 9, 
+in <module>
+    print('close type:', 
+type(c).__name__, 
+'shape:', c.shape, 
+'dtype:', c.dtype)
+                           
+                           
+                  ^^^^^^^
+  File "C:\Users\imama\AppD
+ata\Local\Programs\Python\P
+ython313\Lib\site-packages\
+pandas\core\generic.py", 
+line 6318, in __getattr__
+    return object.__getattr
+ibute__(self, name)
+           ~~~~~~~~~~~~~~~~
+~~~~~~~^^^^^^^^^^^^
+AttributeError: 
+'DataFrame' object has no 
+attribute 'dtype'. Did you 
+mean: 'dtypes'?
+market cols: ['^NSEI', '^NSEI', '^NSEI', '^NSEI', '^NSEI'] <class 'pandas.core.indexes.base.Index'>

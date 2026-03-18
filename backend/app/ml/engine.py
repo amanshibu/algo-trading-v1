@@ -35,17 +35,26 @@ ENTRY_Z = 1.2
 
 @ttl_cache(ttl_seconds=300)
 def fetch_market_data(period="6mo", interval="1h"):
-    data = yf.download(
+    raw = yf.download(
         STOCKS,
         period=period,
         interval=interval,
         progress=False,
-        timeout=10
-    )["Close"]
+        timeout=10,
+    )
+    # yfinance v0.2+ wraps multi-ticker downloads in a MultiIndex.
+    # Flatten it so we can access columns by ticker name directly.
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw = raw["Close"]           # selects the Close level, columns = tickers
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.droplevel(0)
+    else:
+        raw = raw["Close"]
 
-    data = data.dropna()
-    returns = data.pct_change().dropna()
-
+    # Forward-fill then backward-fill so one stock's missing bar
+    # doesn't wipe the entire dataset. Drop only fully-NaN rows.
+    data = raw.ffill().bfill().dropna(how="all")
+    returns = data.pct_change().dropna(how="all")
     return data, returns
 
 
@@ -53,34 +62,65 @@ def fetch_market_data(period="6mo", interval="1h"):
 # STRATEGIES
 # =========================
 
-@ttl_cache(ttl_seconds=3600)
-def _fetch_benchmark(period, interval):
-    market = yf.download(BENCHMARK, period=period, interval=interval, progress=False, timeout=10)
-    if isinstance(market.columns, pd.MultiIndex):
-        market.columns = market.columns.droplevel(0)
-    return market
+@ttl_cache(ttl_seconds=300)
+def _fetch_benchmark_close(period, interval) -> pd.Series:
+    """
+    Fetch NIFTY 50 and return a guaranteed 1-D Close price Series.
+    Handles both old (flat columns) and new (MultiIndex) yfinance formats.
+    Uses a fresh session to avoid stale Yahoo Finance cookies.
+    """
+    raw = yf.download(BENCHMARK, period=period, interval=interval,
+                      progress=False, timeout=10)
+    # New yfinance format: MultiIndex columns like ('Close', '^NSEI')
+    # Selecting raw["Close"] returns a 1-col DataFrame; squeeze → 1D Series.
+    close = raw["Close"].squeeze()
+    if isinstance(close, pd.DataFrame):
+        # Last resort: take the first column
+        close = close.iloc[:, 0]
+    return close.ffill().bfill().dropna()
+
+
+def _extract_close_series(df) -> pd.Series:
+    """
+    Robustly pull a 1-D Close price Series from a DataFrame or Series,
+    regardless of yfinance version / MultiIndex structure.
+    """
+    if isinstance(df, pd.Series):
+        return df
+    close = df["Close"]
+    if isinstance(close, pd.DataFrame):
+        close = close.iloc[:, 0]
+    return close
+
 
 def detect_market_regime(data: pd.DataFrame | None = None):
     """
     Always return BULLISH or BEARISH.
     """
-
     if data is None:
-        market = _fetch_benchmark("3mo", "1d")
-        close = market["Close"].dropna()
+        close = _fetch_benchmark_close("3mo", "1d")
     else:
-        if isinstance(data.columns, pd.MultiIndex):
-            data = data.copy()
-            data.columns = data.columns.droplevel("Ticker")
-        close = data["Close"].dropna()
+        close = _extract_close_series(data).ffill().bfill().dropna()
 
     if len(close) < 50:
         return "BEARISH"
 
-    ma_50 = float(close.rolling(50).mean().values[-1])
-    price = float(close.values[-1])
+    if isinstance(close, pd.DataFrame):
+        close = close.iloc[:, 0]
+    
+    ma_50 = float(close.rolling(50).mean().iloc[-1])
+    try:
+        price = float(close.iloc[-1])
+    except AttributeError:
+        # Fallback if close somehow became a float
+        price = float(close)
 
     return "BULLISH" if price >= ma_50 else "BEARISH"
+
+
+
+
+
 
 
 def build_correlation_clusters(returns, threshold=0.6):
@@ -143,6 +183,11 @@ def generate_signal():
     """
 
     data, returns = fetch_market_data()
+
+    # Guard: if data is empty after cleaning, return a safe fallback.
+    if data.empty or returns.empty:
+        return {"regime": "BEARISH", "signal": None}
+
     regime = detect_market_regime()
     clusters = build_correlation_clusters(returns)
 

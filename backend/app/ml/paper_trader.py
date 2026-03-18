@@ -1,24 +1,27 @@
 """
-Realistic Paper Trading Engine (AngelOne-powered)
-===================================================
+Realistic Paper Trading Engine (DB-backed)
+==========================================
 
-Improvements over old version:
-  1. Uses AngelOne SmartAPI LTP for live prices during market hours
-  2. Falls back to yfinance when AngelOne isn't configured or market is closed
-  3. Enforces market hours (NSE: 9:15 AM – 3:30 PM IST, Mon-Fri)
-  4. Every response includes price_source: "LIVE" | "DELAYED" | "CLOSED"
-  5. Symbol token map covers all stocks used in the ML engine
+All portfolio state (balance, positions, history, peak net worth) is now
+persisted in SQLite via SQLAlchemy so nothing is lost across restarts.
+
+Every public function receives a `db: Session` argument from the caller
+(route handler or auto_trader background loop).
 """
 
 import os
 import pytz
+import pandas as pd
 import yfinance as yf
 from datetime import datetime, time
 from typing import Optional
+from sqlalchemy.orm import Session
+
+from app.database import crud
+from app.ml.cache import ttl_cache
 
 # ============================================================
-# NSE Symbol Token Map (AngelOne → ltpData needs this)
-# Full list: https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json
+# NSE Symbol Token Map
 # ============================================================
 SYMBOL_TOKEN_MAP: dict[str, str] = {
     "HDFCBANK-EQ":  "1333",
@@ -33,12 +36,14 @@ SYMBOL_TOKEN_MAP: dict[str, str] = {
     "NIFTYBEES-EQ": "13635",
 }
 
-INITIAL_BALANCE = 100_000.0   # ₹1,00,000
+INITIAL_BALANCE = 100_000.0
+
+RISK_CONFIG = {
+    "stop_loss_pct": 5.0,
+    "enabled":       True,
+}
 
 IST = pytz.timezone("Asia/Kolkata")
-
-# In-memory portfolio store  { email: { balance, positions, history } }
-_portfolios: dict[str, dict] = {}
 
 
 # ============================================================
@@ -46,9 +51,8 @@ _portfolios: dict[str, dict] = {}
 # ============================================================
 
 def _is_market_open() -> bool:
-    """NSE pre-open: 9:00 AM. Regular session: 9:15 AM – 3:30 PM, Mon–Fri."""
     now = datetime.now(IST)
-    if now.weekday() >= 5:          # Saturday = 5, Sunday = 6
+    if now.weekday() >= 5:
         return False
     market_start = time(9, 15)
     market_end   = time(15, 30)
@@ -56,10 +60,8 @@ def _is_market_open() -> bool:
 
 
 def _market_status() -> dict:
-    """Returns current market status with next open time."""
-    now = datetime.now(IST)
+    now   = datetime.now(IST)
     open_ = _is_market_open()
-
     if now.weekday() >= 5:
         msg = "Market closed — Weekend"
     elif now.time() < time(9, 15):
@@ -68,14 +70,13 @@ def _market_status() -> dict:
         msg = "Market closed for today — Opens tomorrow 9:15 AM IST"
     else:
         msg = "Market OPEN"
-
     return {"is_open": open_, "message": msg, "time_ist": now.strftime("%H:%M:%S IST")}
 
 
 def _minutes_until(h: int, m: int) -> int:
-    now = datetime.now(IST)
+    now    = datetime.now(IST)
     target = now.replace(hour=h, minute=m, second=0, microsecond=0)
-    delta = (target - now).total_seconds()
+    delta  = (target - now).total_seconds()
     return max(0, int(delta // 60))
 
 
@@ -84,27 +85,22 @@ def _minutes_until(h: int, m: int) -> int:
 # ============================================================
 
 def _ticker_to_angelone(ticker: str) -> tuple[str, str]:
-    """Convert 'HDFCBANK.NS' → ('HDFCBANK-EQ', '1333')."""
-    base = ticker.replace(".NS", "").replace(".BO", "")
+    base         = ticker.replace(".NS", "").replace(".BO", "")
     angel_symbol = f"{base}-EQ"
-    token = SYMBOL_TOKEN_MAP.get(angel_symbol, "")
+    token        = SYMBOL_TOKEN_MAP.get(angel_symbol, "")
     return angel_symbol, token
 
-
+@ttl_cache(ttl_seconds=60)
 def _get_price_from_angelone(ticker: str) -> Optional[float]:
-    """Fetch LTP from AngelOne. Returns None on any failure."""
     try:
         required = ["ANGELONE_CLIENT_ID", "ANGELONE_PIN", "ANGELONE_TOTP_SECRET"]
         if any(not os.getenv(k, "").strip() for k in required):
-            return None                   # Not configured
-
+            return None
         from app.trading.angelone_broker import get_session
         session, _ = get_session()
-
         angel_symbol, token = _ticker_to_angelone(ticker)
         if not token:
-            return None                   # Unknown symbol token
-
+            return None
         result = session.ltpData("NSE", angel_symbol, token)
         if result and result.get("status") and result.get("data"):
             return float(result["data"]["ltp"])
@@ -113,173 +109,187 @@ def _get_price_from_angelone(ticker: str) -> Optional[float]:
         return None
 
 
+@ttl_cache(ttl_seconds=60)
 def _get_price_from_yfinance(ticker: str) -> float:
-    """Fetch last known price using yfinance (works even after market close)."""
     try:
         yf_ticker = ticker if ".NS" in ticker else f"{ticker}.NS"
-        data = yf.download(yf_ticker, period="5d", interval="1d", progress=False)["Close"]
-        if hasattr(data, "columns"):
-            data = data.iloc[:, 0]
-        data = data.dropna()
-        return float(data.iloc[-1]) if len(data) > 0 else 0.0
-    except Exception:
+        info = yf.Ticker(yf_ticker).fast_info
+        return float(info["last_price"])
+    except Exception as e:
+        print(f"[PaperTrader] yfinance error for {ticker}: {e}")
         return 0.0
 
 
 def get_live_price(ticker: str) -> tuple[float, str]:
-    """
-    Returns (price, source) where source is:
-      "LIVE"    → from AngelOne during market hours
-      "DELAYED" → from yfinance (market open but AngelOne not configured)
-      "CLOSED"  → last known price, market is closed
-    """
     if _is_market_open():
         angel_price = _get_price_from_angelone(ticker)
         if angel_price and angel_price > 0:
             return angel_price, "LIVE"
-        # Fallback to yfinance if AngelOne not configured
         return _get_price_from_yfinance(ticker), "DELAYED"
     else:
-        # Market closed — return last known (yfinance daily)
         return _get_price_from_yfinance(ticker), "CLOSED"
 
 
 # ============================================================
-# Portfolio Management
+# Portfolio Management (DB-backed)
 # ============================================================
 
-def _get_user_portfolio(email: str) -> dict:
-    if email not in _portfolios:
-        _portfolios[email] = {
-            "balance":   INITIAL_BALANCE,
-            "positions": [],
-            "history":   [],
-        }
-    return _portfolios[email]
-
-
-def get_portfolio(email: str) -> dict:
+def get_portfolio(email: str, db: Session) -> dict:
     """Returns the paper portfolio with live P&L and market status."""
-    user_portfolio = _get_user_portfolio(email)
-    positions_with_pnl = []
-    total_unrealised = 0.0
+    pf     = crud.get_or_create_portfolio(db, email)
+    raw_positions = crud.get_positions(db, pf.id)
 
-    for pos in user_portfolio["positions"]:
-        price, source = get_live_price(pos["ticker"])
-        if pos["action"] == "BUY":
-            pnl = (price - pos["entry_price"]) * pos["qty"]
+    positions_with_pnl = []
+    total_unrealised   = 0.0
+
+    for pos in raw_positions:
+        price, source = get_live_price(pos.ticker)
+        
+        # Fallback if price is 0 so it doesn't crash the portfolio value
+        if price <= 0:
+            price = pos.entry_price
+            source = "FALLBACK"
+            
+        if pos.action == "BUY":
+            pnl = (price - pos.entry_price) * pos.qty
         else:
-            pnl = (pos["entry_price"] - price) * pos["qty"]
+            pnl = (pos.entry_price - price) * pos.qty
 
         total_unrealised += pnl
         positions_with_pnl.append({
-            **pos,
+            "ticker":         pos.ticker,
+            "action":         pos.action,
+            "qty":            pos.qty,
+            "entry_price":    pos.entry_price,
+            "entry_time":     pos.entry_time,
+            "cost":           pos.cost,
+            "price_source":   pos.price_source,
             "current_price":  round(price, 2),
-            "price_source":   source,
             "unrealised_pnl": round(pnl, 2),
         })
 
-    total_realised = sum(t.get("pnl", 0) for t in user_portfolio["history"])
+    raw_history    = crud.get_trade_history(db, pf.id, limit=20)
+    total_realised = crud.get_total_realised_pnl(db, pf.id)
+
+    history_list = [
+        {
+            "ticker":       t.ticker,
+            "action":       t.action,
+            "qty":          t.qty,
+            "entry_price":  t.entry_price,
+            "exit_price":   t.exit_price,
+            "entry_time":   t.entry_time,
+            "exit_time":    t.exit_time,
+            "pnl":          t.pnl,
+            "price_source": t.price_source,
+        }
+        for t in raw_history
+    ]
 
     return {
-        "balance":              round(user_portfolio["balance"], 2),
+        "balance":              round(pf.balance, 2),
         "initial_balance":      INITIAL_BALANCE,
         "positions":            positions_with_pnl,
-        "history":              user_portfolio["history"][-20:],
+        "history":              history_list,
         "total_unrealised_pnl": round(total_unrealised, 2),
         "total_realised_pnl":   round(total_realised, 2),
-        "net_worth":            round(user_portfolio["balance"] + total_unrealised, 2),
+        "net_worth":            round(pf.balance + total_unrealised, 2),
         "market":               _market_status(),
     }
 
 
-def execute_trade(email: str, ticker: str, action: str, qty: int = 1) -> dict:
+def execute_trade(email: str, ticker: str, action: str, qty: int = 1,
+                  db: Session = None) -> dict:
     """
     Execute a paper trade.
-    - Blocks trading when market is closed (realistic behaviour).
-    - Uses AngelOne LTP when available, yfinance otherwise.
-    - CLOSE action works even outside market hours (realistic).
+    - Blocks new BUY/SELL when market is closed.
+    - CLOSE works any time.
     """
-    user_portfolio = _get_user_portfolio(email)
-    now_ist = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
+    # Initialise BEFORE the try block so finally never hits NameError
+    _close_session = False
+    if db is None:
+        from app.database.db import SessionLocal
+        db = SessionLocal()
+        _close_session = True
 
-    # CLOSE works any time (closing positions can happen via AMO etc.)
-    if action == "CLOSE":
-        return _close_position(email, user_portfolio, ticker, now_ist)
+    try:
+        pf      = crud.get_or_create_portfolio(db, email)
+        now_ist = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
 
-    # --- Market Hours Check ---
-    if not _is_market_open():
-        status = _market_status()
+        if action == "CLOSE":
+            return _close_position(email, pf, ticker, now_ist, db)
+
+        if not _is_market_open():
+            return {
+                "error":  "Market is closed. Paper trades simulate real market conditions.",
+                "market": _market_status(),
+                "hint":   "NSE Regular Session: Mon–Fri, 9:15 AM – 3:30 PM IST",
+            }
+
+        live_price, price_source = get_live_price(ticker)
+        if live_price <= 0:
+            return {"error": f"Could not fetch price for {ticker}. Please try again."}
+
+        cost = live_price * qty
+        if cost > pf.balance:
+            return {
+                "error": f"Insufficient balance. Need ₹{cost:,.2f}, have ₹{pf.balance:,.2f}"
+            }
+
+        # Deduct balance
+        crud.update_portfolio_balance(db, pf, pf.balance - cost)
+
+        yf_ticker = ticker if ".NS" in ticker else f"{ticker}.NS"
+        position  = crud.add_position(
+            db, pf.id, yf_ticker, action, qty,
+            round(live_price, 2), now_ist, round(cost, 2), price_source,
+        )
+
         return {
-            "error":  "Market is closed. Paper trades simulate real market conditions.",
-            "market": status,
-            "hint":   "NSE Regular Session: Mon–Fri, 9:15 AM – 3:30 PM IST"
+            "status":            "executed",
+            "mode":              "PAPER",
+            "trade": {
+                "ticker":       position.ticker,
+                "action":       position.action,
+                "qty":          position.qty,
+                "entry_price":  position.entry_price,
+                "entry_time":   position.entry_time,
+                "cost":         position.cost,
+                "price_source": position.price_source,
+            },
+            "price_source":      price_source,
+            "remaining_balance": round(pf.balance, 2),
+            "market":            _market_status(),
         }
-
-    # --- Fetch Price ---
-    live_price, price_source = get_live_price(ticker)
-
-    if live_price <= 0:
-        return {"error": f"Could not fetch price for {ticker}. Please try again."}
-
-    cost = live_price * qty
-
-    if cost > user_portfolio["balance"]:
-        return {
-            "error": f"Insufficient balance. Need ₹{cost:,.2f}, have ₹{user_portfolio['balance']:,.2f}"
-        }
-
-    # --- Open Position ---
-    yf_ticker = ticker if ".NS" in ticker else f"{ticker}.NS"
-    user_portfolio["balance"] -= cost
-
-    position = {
-        "ticker":      yf_ticker,
-        "action":      action,
-        "qty":         qty,
-        "entry_price": round(live_price, 2),
-        "entry_time":  now_ist,
-        "cost":        round(cost, 2),
-        "price_source": price_source,
-    }
-    user_portfolio["positions"].append(position)
-
-    return {
-        "status":            "executed",
-        "mode":              "PAPER",
-        "trade":             position,
-        "price_source":      price_source,
-        "remaining_balance": round(user_portfolio["balance"], 2),
-        "market":            _market_status(),
-    }
+    finally:
+        if _close_session:
+            db.close()
 
 
-def _close_position(email: str, user_portfolio: dict, ticker: str, now_ist: str) -> dict:
+def _close_position(email: str, pf, ticker: str, now_ist: str, db: Session) -> dict:
     """Close the first matching open position and realise P&L."""
     yf_ticker = ticker if ".NS" in ticker else f"{ticker}.NS"
+    positions = crud.get_positions(db, pf.id)
 
-    for i, pos in enumerate(user_portfolio["positions"]):
-        if pos["ticker"] == yf_ticker:
+    for pos in positions:
+        if pos.ticker == yf_ticker:
             exit_price, source = get_live_price(yf_ticker)
-
-            if pos["action"] == "BUY":
-                pnl = (exit_price - pos["entry_price"]) * pos["qty"]
+            if exit_price <= 0:
+                return {"error": f"Could not fetch live price to close {ticker}. Try again."}
+                
+            if pos.action == "BUY":
+                pnl = (exit_price - pos.entry_price) * pos.qty
             else:
-                pnl = (pos["entry_price"] - exit_price) * pos["qty"]
+                pnl = (pos.entry_price - exit_price) * pos.qty
 
-            user_portfolio["balance"] += pos["cost"] + pnl
-            user_portfolio["history"].append({
-                "ticker":       pos["ticker"],
-                "action":       pos["action"],
-                "qty":          pos["qty"],
-                "entry_price":  pos["entry_price"],
-                "exit_price":   round(exit_price, 2),
-                "entry_time":   pos["entry_time"],
-                "exit_time":    now_ist,
-                "pnl":          round(pnl, 2),
-                "price_source": source,
-            })
-            user_portfolio["positions"].pop(i)
+            new_balance = pf.balance + pos.cost + pnl
+            crud.update_portfolio_balance(db, pf, new_balance)
+            crud.add_trade_history(
+                db, pf.id, pos.ticker, pos.action, pos.qty,
+                pos.entry_price, round(exit_price, 2),
+                pos.entry_time, now_ist, round(pnl, 2), source,
+            )
+            crud.remove_position(db, pos)
 
             return {
                 "status":            "closed",
@@ -287,24 +297,73 @@ def _close_position(email: str, user_portfolio: dict, ticker: str, now_ist: str)
                 "pnl":               round(pnl, 2),
                 "exit_price":        round(exit_price, 2),
                 "price_source":      source,
-                "remaining_balance": round(user_portfolio["balance"], 2),
+                "remaining_balance": round(new_balance, 2),
                 "market":            _market_status(),
             }
 
     return {"error": f"No open position found for {ticker}"}
 
 
-def add_virtual_funds(email: str, amount: float) -> dict:
-    user_portfolio = _get_user_portfolio(email)
+def add_virtual_funds(email: str, amount: float, db: Session) -> dict:
     if amount <= 0:
         return {"error": "Amount must be positive"}
-    user_portfolio["balance"] += amount
-    return {"balance": round(user_portfolio["balance"], 2), "added": amount}
+    pf = crud.get_or_create_portfolio(db, email)
+    updated = crud.update_portfolio_balance(db, pf, pf.balance + amount)
+    return {"balance": round(updated.balance, 2), "added": amount}
 
 
-def reset_portfolio(email: str) -> dict:
-    user_portfolio = _get_user_portfolio(email)
-    user_portfolio["balance"]   = INITIAL_BALANCE
-    user_portfolio["positions"] = []
-    user_portfolio["history"]   = []
+def reset_portfolio(email: str, db: Session) -> dict:
+    crud.reset_portfolio(db, email)
     return {"status": "reset", "balance": INITIAL_BALANCE}
+
+
+# ============================================================
+# Risk Management — Trailing Stop-Loss
+# ============================================================
+
+def get_margin_status(email: str, db: Session) -> dict:
+    """
+    Returns margin health and whether the trailing SL has fired.
+
+    Trailing SL:
+      - peak_net_worth only ever moves UP
+      - SL level = peak × (1 − stop_loss_pct / 100)
+      - stop_loss_hit when net_worth <= SL level
+    """
+    pf_data   = get_portfolio(email, db)
+    net_worth = pf_data["net_worth"]
+
+    pf  = crud.get_or_create_portfolio(db, email)
+    peak = pf.peak_net_worth
+    if net_worth > peak:
+        peak = net_worth
+        crud.update_portfolio_balance(db, pf, pf.balance, peak_net_worth=peak)
+
+    sl_pct   = RISK_CONFIG["stop_loss_pct"]
+    sl_level = round(peak * (1 - sl_pct / 100), 2)
+
+    return {
+        "net_worth":       round(net_worth, 2),
+        "peak_net_worth":  round(peak, 2),
+        "stop_loss_level": sl_level,
+        "stop_loss_pct":   sl_pct,
+        "stop_loss_hit":   net_worth <= sl_level and RISK_CONFIG["enabled"],
+        "risk_config":     RISK_CONFIG,
+    }
+
+
+def close_all_positions(email: str, db: Session, reason: str = "RISK_TRIGGER") -> dict:
+    """Immediately close every open position. Used by auto_trader on trailing-SL fires."""
+    pf       = crud.get_or_create_portfolio(db, email)
+    positions = crud.get_positions(db, pf.id)
+    tickers  = [p.ticker for p in positions]
+    now_ist  = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
+    results  = []
+    for ticker in tickers:
+        res = _close_position(email, pf, ticker, now_ist, db)
+        results.append({"ticker": ticker, **res})
+    return {
+        "reason":  reason,
+        "closed":  len(results),
+        "details": results,
+    }

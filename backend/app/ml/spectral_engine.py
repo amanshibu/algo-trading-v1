@@ -16,6 +16,7 @@ Math:
 """
 
 import numpy as np
+import pandas as pd
 import yfinance as yf
 from app.ml.cache import ttl_cache
 
@@ -31,9 +32,25 @@ SIGNAL_THRESHOLD = 0.0002  # residual threshold for trade signals
 
 @ttl_cache(ttl_seconds=300)
 def _fetch_returns(period="5d", interval="15m"):
-    data = yf.download(STOCKS, period=period, interval=interval, progress=False, timeout=10)["Close"]
-    data = data.dropna()
-    returns = data.pct_change().dropna()
+    raw = yf.download(
+        STOCKS,
+        period=period,
+        interval=interval,
+        progress=False,
+        timeout=10,
+    )
+    # yfinance v0.2+ wraps multi-ticker downloads in a MultiIndex.
+    if isinstance(raw.columns, pd.MultiIndex):
+        data = raw["Close"]
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.droplevel(0)
+    else:
+        data = raw["Close"]
+
+    # Forward-fill then backward-fill to avoid one stock's missing candle
+    # from wiping the entire matrix. Only drop rows that are still fully NaN.
+    data = data.ffill().bfill().dropna(how="all")
+    returns = data.pct_change().dropna(how="all")
     return returns
 
 
@@ -42,8 +59,10 @@ def get_correlation_matrix():
     Returns the full correlation heatmap data.
     """
     returns = _fetch_returns()
-    W = returns.corr().values
+    if returns.empty or len(returns) < 2:
+        return {"stocks": [], "matrix": [], "error": "Insufficient market data — try again shortly."}
 
+    W = returns.corr().values
     clean_names = [s.replace(".NS", "") for s in STOCKS]
 
     return {
@@ -58,6 +77,14 @@ def get_spectral_signal():
     plus trade recommendations.
     """
     returns = _fetch_returns()
+
+    if returns.empty or len(returns) < 2:
+        return {
+            "stocks": [], "raw": [], "smoothed": [],
+            "residuals": [], "signals": [],
+            "error": "Insufficient market data — try again shortly.",
+        }
+
     W = returns.corr().values
 
     # Latest return vector

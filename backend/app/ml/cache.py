@@ -1,9 +1,11 @@
 import time
+import threading
 from functools import wraps
 
 def ttl_cache(ttl_seconds=300):
     """Simple in-memory TTL cache to avoid frequent yfinance calls."""
     _cache = {}
+    _lock = threading.Lock()
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -12,8 +14,15 @@ def ttl_cache(ttl_seconds=300):
                 val, timestamp = _cache[key]
                 if time.time() - timestamp < ttl_seconds:
                     return val
-            val = func(*args, **kwargs)
-            _cache[key] = (val, time.time())
-            return val
+            
+            with _lock:
+                if key in _cache:
+                    val, timestamp = _cache[key]
+                    if time.time() - timestamp < ttl_seconds:
+                        return val
+
+                val = func(*args, **kwargs)
+                _cache[key] = (val, time.time())
+                return val
         return wrapper
     return decorator
