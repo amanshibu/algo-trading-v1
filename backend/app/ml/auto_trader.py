@@ -31,6 +31,7 @@ def _get_all_user_emails() -> list[str]:
 def _run_auto_trader_cycle():
     now          = datetime.now()
     target_emails = _get_all_user_emails()
+    logged_this_cycle = set()
 
     # --- Fetch signals ONCE (outside the per-user loop) ---
     spectral = get_spectral_signal()
@@ -48,7 +49,8 @@ def _run_auto_trader_cycle():
                 margin = get_margin_status(email, db)
                 if margin["stop_loss_hit"]:
                     close_all_positions(email, db, reason="TRAILING_STOP_LOSS")
-                    if i == 0:
+                    if "TRAILING_SL" not in logged_this_cycle:
+                        logged_this_cycle.add("TRAILING_SL")
                         ALERTS.insert(0, {
                             "id":        f"{now.timestamp()}_trailing_sl",
                             "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
@@ -79,7 +81,9 @@ def _run_auto_trader_cycle():
                     res = execute_trade(email, sig["ticker"], "BUY", 1, db)
                     if "error" not in res:
                         open_tickers.append(yf_ticker)
-                        if i == 0:
+                        buy_key = f"buy_{sig['ticker']}"
+                        if buy_key not in logged_this_cycle:
+                            logged_this_cycle.add(buy_key)
                             ALERTS.insert(0, {
                                 "id":        str(now.timestamp()) + "_buy",
                                 "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
@@ -100,7 +104,9 @@ def _run_auto_trader_cycle():
                             res = execute_trade(email, sig["ticker"], "CLOSE", 1, db)
                             if "error" not in res:
                                 open_tickers.remove(yf_ticker)
-                                if i == 0:
+                                close_key = f"close_{sig['ticker']}"
+                                if close_key not in logged_this_cycle:
+                                    logged_this_cycle.add(close_key)
                                     pnl = res.get("pnl", 0)
                                     ALERTS.insert(0, {
                                         "id":        str(now.timestamp()) + "_close",
@@ -115,7 +121,9 @@ def _run_auto_trader_cycle():
                         res = execute_trade(email, sig["ticker"], "SELL", 1, db)
                         if "error" not in res:
                             open_tickers.append(yf_ticker)
-                            if i == 0:
+                            short_key = f"short_{sig['ticker']}"
+                            if short_key not in logged_this_cycle:
+                                logged_this_cycle.add(short_key)
                                 ALERTS.insert(0, {
                                     "id":        str(now.timestamp()) + "_short",
                                     "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
@@ -143,22 +151,27 @@ def _run_auto_trader_cycle():
                         res_a = execute_trade(email, a, "SELL", 1, db)
                         res_b = execute_trade(email, b, "BUY",  1, db)
 
-                    if ("error" not in res_a or "error" not in res_b) and i == 0:
-                        ALERTS.insert(0, {
-                            "id":        str(now.timestamp()) + "_pair",
-                            "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
-                            "strategy":  "Statistical Arbitrage",
-                            "ticker":    pair,
-                            "action":    f"AUTO-EXECUTE: {action_text}",
-                            "reason":    reason,
-                            "details":   f"Confidence: {sig2.get('confidence', 0)*100:.1f}% | Legs Traded (Paper)",
-                        })
+                    if ("error" not in res_a or "error" not in res_b):
+                        pair_key = f"pair_{pair}"
+                        if pair_key not in logged_this_cycle:
+                            logged_this_cycle.add(pair_key)
+                            ALERTS.insert(0, {
+                                "id":        str(now.timestamp()) + "_pair",
+                                "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+                                "strategy":  "Statistical Arbitrage",
+                                "ticker":    pair,
+                                "action":    f"AUTO-EXECUTE: {action_text}",
+                                "reason":    reason,
+                                "details":   f"Confidence: {sig2.get('confidence', 0)*100:.1f}% | Legs Traded (Paper)",
+                            })
                 else:
                     z = sig2.get("z_score", 1.0)
                     if abs(z) < 0.2:
                         res_a = execute_trade(email, a, "CLOSE", 1, db)
                         res_b = execute_trade(email, b, "CLOSE", 1, db)
-                        if i == 0:
+                        pair_close_key = f"pair_close_{pair}"
+                        if pair_close_key not in logged_this_cycle:
+                            logged_this_cycle.add(pair_close_key)
                             pnl_a = res_a.get("pnl", 0) if "error" not in res_a else 0
                             pnl_b = res_b.get("pnl", 0) if "error" not in res_b else 0
                             ALERTS.insert(0, {

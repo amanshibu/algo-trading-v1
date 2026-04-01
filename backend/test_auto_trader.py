@@ -11,7 +11,12 @@ async def test():
     task = asyncio.create_task(auto_trader_loop())
     await asyncio.sleep(5)
     print("ALERTS:", ALERTS)
-    print("PORTFOLIO:", get_portfolio("demo@algotrader.local"))
+    from app.database.db import SessionLocal
+    db = SessionLocal()
+    try:
+        print("PORTFOLIO:", get_portfolio("demo@algotrader.local", db))
+    finally:
+        db.close()
     task.cancel()
 
 asyncio.run(test())

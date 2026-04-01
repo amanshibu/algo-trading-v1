@@ -31,8 +31,8 @@ def get_strategy_signal():
 
 
 @router.get("/backtest")
-def backtest():
-    return run_backtest()
+def backtest(symbol: str = "NIFTYBEES.NS", period: str = "6mo", interval: str = "1d", ma_period: int = 10):
+    return run_backtest(symbol=symbol, period=period, interval=interval, ma_period=ma_period)
 
 
 @router.get("/list")
@@ -229,6 +229,8 @@ def paper_add_funds(data: FundsRequest, user=Depends(get_optional_user),
 def paper_reset(user=Depends(get_optional_user), db: Session = Depends(get_db)):
     """Reset paper portfolio to initial state."""
     email = user["email"] if isinstance(user, dict) else user.email
+    from app.ml.auto_trader import ALERTS
+    ALERTS.clear()
     return reset_portfolio(email, db)
 
 

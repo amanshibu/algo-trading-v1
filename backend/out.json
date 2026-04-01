@@ -1,0 +1,30 @@
+{
+    "1mo": {
+        "Total Trades": 0,
+        "Win Rate": "0.0%"
+    },
+    "1wk": {
+        "Total Trades": 0,
+        "Win Rate": "0.0%"
+    },
+    "1d": {
+        "Total Trades": 7,
+        "Win Rate": "28.6%"
+    },
+    "1h": {
+        "Total Trades": 35,
+        "Win Rate": "25.7%"
+    },
+    "15m": {
+        "Total Trades": 118,
+        "Win Rate": "33.9%"
+    },
+    "5m": {
+        "Total Trades": 158,
+        "Win Rate": "16.5%"
+    },
+    "1m": {
+        "Total Trades": 169,
+        "Win Rate": "22.5%"
+    }
+}
